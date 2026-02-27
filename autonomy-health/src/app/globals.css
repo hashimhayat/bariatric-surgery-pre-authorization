@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: #f8f7fc;
+  --foreground: #2d2a3e;
+  --sidebar-bg: #f0eef8;
+  --card-bg: #ffffff;
+  --border: #e4dff0;
+  --border-light: #ede9f7;
+  --accent-primary: #8b7ec8;
+  --accent-soft: #c4bbea;
+}
+
+.dark {
+  --background: #0a0a0a;
+  --foreground: #ededed;
+  --sidebar-bg: #111111;
+  --card-bg: #1a1a1a;
+  --border: #2a2a2a;
+  --border-light: #222222;
+  --accent-primary: #a89adb;
+  --accent-soft: #4a4270;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--accent-soft) transparent;
+}
+
+.dark * {
+  scrollbar-color: #3f3f46 transparent;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-slideIn {
+  animation: slideIn 0.2s ease-out;
+}
