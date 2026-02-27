@@ -496,6 +496,21 @@ With index:     B-tree lookup → 1-2 rows returned      →  0.26s  (22× faste
 
 **Bottom line**: For a single-user clinician review tool processing synthetic data, JSON-in-SQLite hits the sweet spot — zero deployment overhead, fast queries with expression indexes, and no information loss from the source FHIR records.
 
+### Industry Tools Using the Same Pattern
+
+The `json_extract` approach isn't just a local hack — it's how major cloud platforms handle FHIR data at scale:
+
+| Tool / Platform | JSON Query Function | How It Handles FHIR |
+|---|---|---|
+| **AWS HealthLake + Athena** | `json_extract()` (Trino/Presto) | Stores FHIR resources in Apache Iceberg tables. Queries use `json_extract` on nested fields like `extension[1]` and joins via `CONCAT('Patient/', patient.id) = condition.subject.reference` — [identical to our pattern](https://docs.aws.amazon.com/healthlake/latest/devguide/integrating-athena-complex-filtering.html) |
+| **Google Cloud Healthcare API + BigQuery** | `JSON_EXTRACT()` / dot notation | Exports FHIR stores to BigQuery, flattening nested JSON into queryable tables. Supports streaming sync for near real-time analytics |
+| **Snowflake** | `VARIANT` column + `FLATTEN()` | Stores FHIR JSON in `VARIANT` columns (similar to our `TEXT` + `json_extract`). Uses `LATERAL FLATTEN` to unnest arrays like `coding[]` and `extension[]` |
+| **Azure SQL / SQL Server** | `JSON_VALUE()` / `OPENJSON()` | `JSON_VALUE` extracts scalar values (like our `json_extract`). `OPENJSON` expands arrays into rows for tabular analysis |
+| **PostgreSQL (Fhirbase / Aidbox)** | `JSONB` + `@>` / `->>` operators | Purpose-built FHIR servers storing resources as `JSONB`. GIN indexes on JSON paths for fast containment queries. Most similar to our approach conceptually |
+| **SQL on FHIR (emerging standard)** | ViewDefinition + SQL | HL7-backed specification for creating reusable tabular views from FHIR JSON. Aims to standardize what every platform above does ad-hoc |
+
+**Key insight**: Every platform above stores FHIR as JSON and queries it with extraction functions — they just use different SQL dialects. Our SQLite + `json_extract` approach is the same fundamental pattern, optimized for local single-user use.
+
 ---
 
 ## Design
