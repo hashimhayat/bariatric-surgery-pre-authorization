@@ -1,0 +1,125 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ─── Clinical Resources (Patient-Linked) ────────────────────────────────────
+
+model Patient {
+  id   String @id
+  data String
+
+  @@map("Patient")
+}
+
+model Condition {
+  id   String @id
+  data String
+
+  @@map("Condition")
+}
+
+model Observation {
+  id   String @id
+  data String
+
+  @@map("Observation")
+}
+
+model FhirProcedure {
+  id   String @id
+  data String
+
+  @@map("Procedure")
+}
+
+model Encounter {
+  id   String @id
+  data String
+
+  @@map("Encounter")
+}
+
+model MedicationRequest {
+  id   String @id
+  data String
+
+  @@map("MedicationRequest")
+}
+
+model DiagnosticReport {
+  id   String @id
+  data String
+
+  @@map("DiagnosticReport")
+}
+
+model DocumentReference {
+  id   String @id
+  data String
+
+  @@map("DocumentReference")
+}
+
+model Immunization {
+  id   String @id
+  data String
+
+  @@map("Immunization")
+}
+
+model AllergyIntolerance {
+  id   String @id
+  data String
+
+  @@map("AllergyIntolerance")
+}
+
+model Device {
+  id   String @id
+  data String
+
+  @@map("Device")
+}
+
+// ─── Administrative Resources ───────────────────────────────────────────────
+
+model Organization {
+  id   String @id
+  data String
+
+  @@map("Organization")
+}
+
+model Location {
+  id   String @id
+  data String
+
+  @@map("Location")
+}
+
+model Practitioner {
+  id   String @id
+  data String
+
+  @@map("Practitioner")
+}
+
+model PractitionerRole {
+  id   String @id
+  data String
+
+  @@map("PractitionerRole")
+}
+
+// ─── System ─────────────────────────────────────────────────────────────────
+
+model Log {
+  id   String @id
+  data String
+
+  @@map("log")
+}
