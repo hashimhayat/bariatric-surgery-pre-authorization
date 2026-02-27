@@ -334,6 +334,170 @@ Every eligibility check scans 693K observations (BMI lookup), 45K conditions (co
 
 ---
 
+## Querying the Database
+
+All data lives in SQLite as JSON blobs, queried with `json_extract()`. Connect via:
+
+```bash
+sqlite3 data/fhir_data.db
+```
+
+### Common Patterns
+
+**Get a patient's name and demographics:**
+```sql
+SELECT json_extract(data, '$.name[0].given[0]') AS first_name,
+       json_extract(data, '$.name[0].family')    AS last_name,
+       json_extract(data, '$.gender')             AS gender,
+       json_extract(data, '$.birthDate')          AS dob
+FROM Patient WHERE id = '<patient-uuid>';
+```
+
+**Get all active conditions for a patient:**
+```sql
+SELECT json_extract(data, '$.code.coding[0].display') AS condition,
+       json_extract(data, '$.code.coding[0].code')    AS snomed_code,
+       json_extract(data, '$.onsetDateTime')           AS onset
+FROM Condition
+WHERE json_extract(data, '$.subject.reference') = 'Patient/<uuid>'
+  AND json_extract(data, '$.clinicalStatus.coding[0].code') = 'active';
+```
+
+**Get the latest BMI reading:**
+```sql
+SELECT json_extract(data, '$.valueQuantity.value') AS bmi,
+       json_extract(data, '$.effectiveDateTime')    AS date
+FROM Observation
+WHERE json_extract(data, '$.subject.reference') = 'Patient/<uuid>'
+  AND json_extract(data, '$.code.coding[0].code') = '39156-5'
+ORDER BY json_extract(data, '$.effectiveDateTime') DESC
+LIMIT 1;
+```
+
+**Find patients with qualifying comorbidities (hypertension, T2DM, sleep apnea):**
+```sql
+SELECT DISTINCT REPLACE(json_extract(data, '$.subject.reference'), 'Patient/', '') AS patient_id,
+       json_extract(data, '$.code.coding[0].display') AS condition
+FROM Condition
+WHERE json_extract(data, '$.clinicalStatus.coding[0].code') = 'active'
+  AND json_extract(data, '$.code.coding[0].code') IN (
+      '59621000',  -- Hypertension
+      '44054006',  -- Type 2 Diabetes
+      '73430006'   -- Sleep Apnea
+  );
+```
+
+**Get all procedures for a patient (chronological):**
+```sql
+SELECT json_extract(data, '$.code.coding[0].display') AS name,
+       json_extract(data, '$.performedPeriod.start')   AS date,
+       json_extract(data, '$.status')                   AS status
+FROM "Procedure"
+WHERE json_extract(data, '$.subject.reference') = 'Patient/<uuid>'
+ORDER BY date DESC;
+```
+
+**Cohort analysis — all patients with BMI ≥ 40:**
+```sql
+SELECT p.id,
+       json_extract(p.data, '$.name[0].given[0]') AS name,
+       o.bmi
+FROM Patient p
+JOIN (
+    SELECT json_extract(data, '$.subject.reference') AS ref,
+           json_extract(data, '$.valueQuantity.value') AS bmi,
+           ROW_NUMBER() OVER (
+               PARTITION BY json_extract(data, '$.subject.reference')
+               ORDER BY json_extract(data, '$.effectiveDateTime') DESC
+           ) AS rn
+    FROM Observation
+    WHERE json_extract(data, '$.code.coding[0].code') = '39156-5'
+) o ON o.ref = 'Patient/' || p.id AND o.rn = 1
+WHERE o.bmi >= 40;
+```
+
+### Key LOINC Codes (Observations)
+
+| Code | Measurement |
+|---|---|
+| `39156-5` | BMI |
+| `8480-6` | Systolic Blood Pressure |
+| `8462-4` | Diastolic Blood Pressure |
+| `8867-4` | Heart Rate |
+| `29463-7` | Body Weight |
+
+### In Application Code (via Prisma)
+
+Since Prisma doesn't natively support `json_extract`, queries use `$queryRawUnsafe`:
+
+```typescript
+const bmi = await prisma.$queryRawUnsafe<{ value: number; date: string }[]>(
+    `SELECT json_extract(data, '$.valueQuantity.value') AS value,
+            json_extract(data, '$.effectiveDateTime')    AS date
+     FROM Observation
+     WHERE json_extract(data, '$.subject.reference') = ?
+       AND json_extract(data, '$.code.coding[0].code') = '39156-5'
+     ORDER BY date DESC LIMIT 1`,
+    `Patient/${patientId}`
+);
+```
+
+### How `json_extract` Works Under the Hood
+
+SQLite's `json_extract()` is a **scalar function** that parses a JSON text value and navigates a [JSON path](https://www.sqlite.org/json1.html) at query time. When you write:
+
+```sql
+SELECT json_extract(data, '$.subject.reference') FROM Observation;
+```
+
+Here's what happens on each row:
+
+1. **Parse** — SQLite tokenizes the `data` TEXT column into an in-memory JSON tree
+2. **Navigate** — walks the path `$ → subject → reference` through object keys
+3. **Extract** — returns the leaf value as a SQLite type (TEXT, INTEGER, REAL, or NULL)
+
+This is a **runtime operation** — without indexes, every query scans all rows and parses every JSON blob. On 693K Observations (~500 MB of JSON), a naive BMI lookup takes **5.6 seconds**.
+
+#### Expression Indexes: The Key Optimization
+
+SQLite supports **indexes on expressions**, not just columns. When we create:
+
+```sql
+CREATE INDEX idx_obs_subject ON Observation(json_extract(data, '$.subject.reference'));
+CREATE INDEX idx_obs_code    ON Observation(json_extract(data, '$.code.coding[0].code'));
+```
+
+SQLite pre-computes `json_extract(...)` for every row and stores the results in a **B-tree index**. Now when a `WHERE` clause uses the same expression, SQLite recognizes it and does an **O(log N) index lookup** instead of a full table scan:
+
+```
+Without index:  Scan 693K rows → parse JSON → filter  →  5.6s
+With index:     B-tree lookup → 1-2 rows returned      →  0.26s  (22× faster)
+```
+
+#### Why `json_extract` Over Other Approaches?
+
+| Alternative | Why we didn't use it |
+|---|---|
+| **Generated columns** | SQLite supports `AS (json_extract(...)) STORED`, but these inflate table size by duplicating data and require schema changes per field |
+| **Materialized views** | SQLite doesn't support materialized views natively — would need manual refresh triggers |
+| **Application-level parsing** | Moves filtering to Node.js — would need to load all rows into memory, defeating the purpose of a database |
+| **Denormalized columns** | Adding `subject_ref TEXT` columns during ETL would work, but loses the elegance of schema-agnostic tables and complicates the ETL script |
+
+**`json_extract` + expression indexes** gives us the best of both worlds: the simplicity of storing raw FHIR JSON (one table, two columns) with the query performance of a fully indexed relational schema.
+
+### Why This Approach? Comparison with Alternatives
+
+| Approach | Advantages | Disadvantages |
+|---|---|---|
+| **JSON-in-SQLite** *(chosen)* | • Zero infrastructure — single `fhir_data.db` file, no server needed<br>• Preserves original FHIR format — no data loss from schema mapping<br>• Fast ETL (~2 min, stdlib Python only)<br>• Expression indexes make queries fast (22× speedup)<br>• Schema-agnostic — new resource types need zero schema changes | • Queries are verbose (`json_extract` everywhere)<br>• No type safety at the SQL layer<br>• Harder to do complex JOINs across deeply nested JSON<br>• DB file is large (2.5 GB) since JSON is stored verbatim |
+| **Fully Normalized Relational** (one column per field) | • Clean SQL with typed columns<br>• Standard JOINs, foreign keys, constraints<br>• Smaller DB size (no repeated JSON keys)<br>• Full type safety at the DB layer | • Complex ETL — must map every FHIR field to a column<br>• Schema changes needed for each new resource type<br>• Lossy — rarely-used FHIR fields get dropped or ignored<br>• FHIR's polymorphic fields (value[x]) are awkward to model |
+| **PostgreSQL + JSONB** | • Binary JSON — faster parsing than SQLite text JSON<br>• GIN indexes on JSON paths are more flexible<br>• `@>` containment operator for elegant queries<br>• Better concurrency for multi-user apps | • Requires running a PostgreSQL server<br>• Heavier deployment (Docker/managed DB)<br>• Overkill for a single-user review tool<br>• More complex local development setup |
+| **FHIR Server** (HAPI, etc.) | • Purpose-built for FHIR — native search parameters<br>• Standard REST API (`/Patient?name=...`)<br>• Built-in validation and conformance<br>• Handles references, includes, and revIncludes natively | • Heavy infrastructure (Java server + database)<br>• Slow to ingest large datasets<br>• Complex to customize for non-standard queries<br>• Significant learning curve and operational overhead |
+
+**Bottom line**: For a single-user clinician review tool processing synthetic data, JSON-in-SQLite hits the sweet spot — zero deployment overhead, fast queries with expression indexes, and no information loss from the source FHIR records.
+
+---
+
 ## Design
 
 ### Visual Language
