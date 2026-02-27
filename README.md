@@ -307,19 +307,75 @@ Top unknown reason: "No BMI observation recorded" (44 patients, 100% of unknowns
 
 ### Technique: SQLite Expression Indexes on `json_extract` Fields
 
-**12 expression indexes** target the dominant bottleneck — correlated subqueries over deeply nested JSON fields in a 2.5 GB database.
+**26 expression indexes** target the dominant bottleneck — correlated subqueries over deeply nested JSON fields in a 2.5 GB database.
 
-**Subject reference indexes** (7 tables):
-```sql
-CREATE INDEX idx_{Table}_subject ON {Table}(json_extract(data, '$.subject.reference'));
--- Condition, Observation, Encounter, Procedure, MedicationRequest, DiagnosticReport, DocumentReference
-```
+#### 1. Reference Indexes (10) — Link Resources → Patient
 
-**Patient reference indexes** (3 tables):
-```sql
-CREATE INDEX idx_{Table}_patient ON {Table}(json_extract(data, '$.patient.reference'));
--- Immunization, AllergyIntolerance, Device
-```
+Every per-patient query joins on `subject.reference` or `patient.reference`. These are the foundation.
+
+| Index | Table | Indexed Expression |
+|---|---|---|
+| `idx_Condition_subject` | Condition | `json_extract(data, '$.subject.reference')` |
+| `idx_Observation_subject` | Observation | `json_extract(data, '$.subject.reference')` |
+| `idx_Encounter_subject` | Encounter | `json_extract(data, '$.subject.reference')` |
+| `idx_Procedure_subject` | Procedure | `json_extract(data, '$.subject.reference')` |
+| `idx_MedicationRequest_subject` | MedicationRequest | `json_extract(data, '$.subject.reference')` |
+| `idx_DiagnosticReport_subject` | DiagnosticReport | `json_extract(data, '$.subject.reference')` |
+| `idx_DocumentReference_subject` | DocumentReference | `json_extract(data, '$.subject.reference')` |
+| `idx_Immunization_patient` | Immunization | `json_extract(data, '$.patient.reference')` |
+| `idx_AllergyIntolerance_patient` | AllergyIntolerance | `json_extract(data, '$.patient.reference')` |
+| `idx_Device_patient` | Device | `json_extract(data, '$.patient.reference')` |
+
+#### 2. Observation Indexes (6) — BMI, Vitals, Timeline
+
+The Observation table (693K rows) is the most queried. These indexes speed up `getLatestBMI()`, vitals charting, and the observations API.
+
+| Index | Indexed Expression(s) | Query Pattern It Speeds Up |
+|---|---|---|
+| `idx_obs_subject` | `$.subject.reference` | `WHERE subject = ?` |
+| `idx_obs_code` | `$.code.coding[0].code` | `WHERE code = '39156-5'` (BMI by LOINC) |
+| `idx_obs_date` | `$.effectiveDateTime` | `ORDER BY date DESC` |
+| `idx_obs_category` | `$.category[0].coding[0].display` | Filter by observation category |
+| `idx_obs_subject_code` | `$.subject.reference` + `$.code.coding[0].code` | `WHERE subject = ? AND code = ?` |
+| `idx_obs_subject_code_date` | `$.subject.reference` + `$.code.coding[0].code` + `$.effectiveDateTime` | `WHERE subject = ? AND code = ? ORDER BY date DESC LIMIT 1` — **the #1 hot path** (BMI lookup) |
+
+#### 3. Condition Indexes (3) — Comorbidity Check
+
+Used by `getActiveComorbidities()` in the eligibility engine to find hypertension, T2DM, sleep apnea.
+
+| Index | Indexed Expression(s) | Query Pattern It Speeds Up |
+|---|---|---|
+| `idx_cond_subject` | `$.subject.reference` | `WHERE subject = ?` |
+| `idx_cond_subject_status_code` | `$.subject.reference` + `$.clinicalStatus...code` + `$.code...code` | `WHERE subject = ? AND status = 'active' AND code IN (...)` |
+| `idx_cond_subject_status_code2` | `$.subject.reference` + `$.clinicalStatus...code` + `$.code...code` | Same pattern, alternate index for query planner |
+
+#### 4. Procedure Indexes (3) — Weight-Loss & Psych Eval Search
+
+Used by `findDocumentation()` to search for weight-loss attempts and psychological evaluations via `LIKE '%keyword%'` on procedure display names.
+
+| Index | Indexed Expression(s) | Query Pattern It Speeds Up |
+|---|---|---|
+| `idx_proc_subject` | `$.subject.reference` | `WHERE subject = ?` |
+| `idx_proc_display` | `LOWER($.code.coding[0].display)` | `WHERE LOWER(display) LIKE '%weight%'` |
+| `idx_proc_subject_display` | `$.subject.reference` + `LOWER($.code.coding[0].display)` | `WHERE subject = ? AND LOWER(display) LIKE '%keyword%'` |
+
+#### 5. DiagnosticReport Indexes (2) — Documentation Keyword Search
+
+Same keyword search pattern as Procedures, across 160K DiagnosticReport records.
+
+| Index | Indexed Expression(s) | Query Pattern It Speeds Up |
+|---|---|---|
+| `idx_diag_subject` | `$.subject.reference` | `WHERE subject = ?` |
+| `idx_diag_subject_display` | `$.subject.reference` + `LOWER($.code.coding[0].display)` | `WHERE subject = ? AND LOWER(display) LIKE '%keyword%'` |
+
+#### 6. Patient Indexes (2) — Name Search & Sorting
+
+Used by `GET /patients?search=...` for the sidebar patient list with search and alphabetical sorting.
+
+| Index | Indexed Expression | Query Pattern It Speeds Up |
+|---|---|---|
+| `idx_patient_family` | `$.name[0].family` | `WHERE family LIKE ?` + `ORDER BY family ASC` |
+| `idx_patient_given` | `$.name[0].given[0]` | `WHERE given LIKE ?` + `ORDER BY given ASC` |
 
 ### Results
 
@@ -460,11 +516,21 @@ This is a **runtime operation** — without indexes, every query scans all rows 
 
 #### Expression Indexes: The Key Optimization
 
-SQLite supports **indexes on expressions**, not just columns. When we create:
+SQLite supports **indexes on expressions**, not just columns. The ETL script creates 26 indexes across six categories:
 
 ```sql
-CREATE INDEX idx_obs_subject ON Observation(json_extract(data, '$.subject.reference'));
-CREATE INDEX idx_obs_code    ON Observation(json_extract(data, '$.code.coding[0].code'));
+-- Reference indexes (10): link resources to patients
+CREATE INDEX idx_Observation_subject ON Observation(json_extract(data, '$.subject.reference'));
+CREATE INDEX idx_Immunization_patient ON Immunization(json_extract(data, '$.patient.reference'));
+
+-- Code indexes (3): speed up LOINC/SNOMED lookups
+CREATE INDEX idx_Observation_code ON Observation(json_extract(data, '$.code.coding[0].code'));
+
+-- Clinical status (1): filter active conditions
+CREATE INDEX idx_Condition_clinicalStatus ON Condition(json_extract(data, '$.clinicalStatus.coding[0].code'));
+
+-- Date indexes (2): support ORDER BY and range queries
+CREATE INDEX idx_Observation_date ON Observation(json_extract(data, '$.effectiveDateTime'));
 ```
 
 SQLite pre-computes `json_extract(...)` for every row and stores the results in a **B-tree index**. Now when a `WHERE` clause uses the same expression, SQLite recognizes it and does an **O(log N) index lookup** instead of a full table scan:
@@ -541,7 +607,7 @@ The `json_extract` approach isn't just a local hack — it's how major cloud pla
 | 2 | Correctly resolve references (e.g., Condition.subject → Patient) | ✅ | All queries join via `json_extract(data, '$.subject.reference') = 'Patient/' \|\| id`. |
 | 3 | Group all resources by patient | ✅ | Resources queried per-patient using `subject.reference` field. |
 | 4 | Safely handle missing or partial fields | ✅ | TypeScript optional fields, `??` fallbacks, UI shows "—" or "Unknown". |
-| 5 | **Performance optimization** (mandatory) | ✅ | 12 SQLite expression indexes on `json_extract` fields. **Before:** 5.6s → **After:** 0.26s (22× speedup). |
+| 5 | **Performance optimization** (mandatory) | ✅ | 26 SQLite expression indexes on `json_extract` fields. **Before:** 5.6s → **After:** 0.26s (22× speedup). |
 
 ### Part B: Frontend
 | # | Requirement | Status | How |

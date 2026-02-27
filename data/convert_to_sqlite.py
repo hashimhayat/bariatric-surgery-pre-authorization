@@ -72,9 +72,14 @@ def create_database(db_path, raw_data_dir):
         # Commit after each file
         conn.commit()
     
-    # Create some helpful indexes across the DB to make common FHIR queries fast
-    print("Creating basic indexes...")
+    # ─────────────────────────────────────────────────────────────────────────
+    # Create expression indexes for fast json_extract queries.
+    # 26 custom indexes organized by query pattern.
+    # ─────────────────────────────────────────────────────────────────────────
+    print("Creating indexes...")
     try:
+        # ── 1. Reference indexes (10): link clinical resources → Patient ──
+        #    Used by: every per-patient query across all API routes
         tables_with_subject = ['Condition', 'Observation', 'Encounter', 'Procedure', 
                               'MedicationRequest', 'DiagnosticReport', 'DocumentReference']
         for table in tables_with_subject:
@@ -88,8 +93,60 @@ def create_database(db_path, raw_data_dir):
             if cursor.fetchone():
                 cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_patient ON {table}(json_extract(data, '$.patient.reference'))")
 
+        # ── 2. Observation indexes (6): BMI lookups, vitals charting, timeline ──
+        #    Used by: GET /patients/:id (vitals), GET /patients/:id/observations,
+        #             eligibility engine getLatestBMI(), batch eligibility filter
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_obs_subject ON Observation(json_extract(data, '$.subject.reference'))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_obs_code ON Observation(json_extract(data, '$.code.coding[0].code'))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_obs_date ON Observation(json_extract(data, '$.effectiveDateTime'))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_obs_category ON Observation(json_extract(data, '$.category[0].coding[0].display'))")
+        # Compound: WHERE subject=? AND code=?
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_obs_subject_code ON Observation(json_extract(data, '$.subject.reference'), json_extract(data, '$.code.coding[0].code'))")
+        # Triple compound: WHERE subject=? AND code=? ORDER BY date DESC
+        cursor.execute("""CREATE INDEX IF NOT EXISTS idx_obs_subject_code_date ON Observation (
+            json_extract(data, '$.subject.reference'),
+            json_extract(data, '$.code.coding[0].code'),
+            json_extract(data, '$.effectiveDateTime')
+        )""")
+
+        # ── 3. Condition indexes (3): comorbidity check, active condition lists ──
+        #    Used by: eligibility engine getActiveComorbidities(), clinical snapshot
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_cond_subject ON Condition(json_extract(data, '$.subject.reference'))")
+        # Compound: WHERE subject=? AND clinicalStatus='active' AND code IN (...)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_cond_subject_status_code ON Condition(json_extract(data, '$.subject.reference'), json_extract(data, '$.clinicalStatus.coding[0].code'), json_extract(data, '$.code.coding[0].code'))")
+        cursor.execute("""CREATE INDEX IF NOT EXISTS idx_cond_subject_status_code2 ON Condition (
+            json_extract(data, '$.subject.reference'),
+            json_extract(data, '$.clinicalStatus.coding[0].code'),
+            json_extract(data, '$.code.coding[0].code')
+        )""")
+
+        # ── 4. Procedure indexes (3): weight-loss & psych eval keyword search ──
+        #    Used by: eligibility engine findDocumentation(), batch eligibility filter
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_proc_subject ON \"Procedure\"(json_extract(data, '$.subject.reference'))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_proc_display ON \"Procedure\"(LOWER(json_extract(data, '$.code.coding[0].display')))")
+        cursor.execute("""CREATE INDEX IF NOT EXISTS idx_proc_subject_display ON "Procedure" (
+            json_extract(data, '$.subject.reference'),
+            LOWER(json_extract(data, '$.code.coding[0].display'))
+        )""")
+
+        # ── 5. DiagnosticReport indexes (2): keyword search for documentation ──
+        #    Used by: eligibility engine findDocumentation() across DiagnosticReport
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_diag_subject ON DiagnosticReport(json_extract(data, '$.subject.reference'))")
+        cursor.execute("""CREATE INDEX IF NOT EXISTS idx_diag_subject_display ON DiagnosticReport (
+            json_extract(data, '$.subject.reference'),
+            LOWER(json_extract(data, '$.code.coding[0].display'))
+        )""")
+
+        # ── 6. Patient indexes (2): name search in patient list sidebar ──
+        #    Used by: GET /patients?search=... ORDER BY family, given
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_patient_family ON Patient(json_extract(data, '$.name[0].family'))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_patient_given ON Patient(json_extract(data, '$.name[0].given[0]'))")
+
+        conn.commit()
+        print("  Created 26 expression indexes.")
+
     except Exception as e:
-        print(f"Warning: Could not create indexes: {e}")
+        print(f"Warning: Could not create some indexes: {e}")
 
     conn.close()
     print(f"Database creation complete. File saved to {db_path}")
